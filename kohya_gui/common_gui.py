@@ -16,6 +16,8 @@ import json
 import math
 import shutil
 import toml
+import tarfile
+import io
 
 # Set up logging
 log = setup_logging()
@@ -1291,14 +1293,16 @@ def SaveConfigFile(
     }
 
     # Check if the folder path for the file_path is valid
-    # Extrach folder path
+    # Extract folder path
     folder_path = os.path.dirname(file_path)
 
-    # Check if the folder exists
-    if not os.path.exists(folder_path):
-        # If not, create the folder
-        os.makedirs(os.path.dirname(folder_path))
-        log.info(f"Creating folder {folder_path} for the configuration file...")
+    # Create directory only if a folder component exists and is missing
+    if folder_path and not os.path.exists(folder_path):
+        os.makedirs(folder_path, exist_ok=True)
+        log.info(f"Creating folder '{folder_path}' for the configuration file...")
+    elif not folder_path:
+        # file_path is just a filename in current working directory
+        log.debug("SaveConfigFile: no folder component in file_path; saving in current directory.")
 
     # Save the data to the specified JSON file
     with open(file_path, "w", encoding="utf-8") as file:
@@ -1427,6 +1431,206 @@ def validate_folder_path(
         return False
     log.info(f"{msg} SUCCESS")
     return True
+
+
+def is_tar_like_file(path: str) -> bool:
+    """Return True if path points to an existing tar / compressed tar archive."""
+    if not path:
+        return False
+    if not os.path.isfile(path):
+        return False
+    lower = path.lower()
+    return lower.endswith(
+        (
+            ".tar",
+            ".tar.gz",
+            ".tgz",
+            ".tar.bz2",
+            ".tbz2",
+            ".tar.xz",
+            ".txz",
+            ".tar.zst",
+        )
+    )
+
+
+def validate_train_data_path(train_data_path: str) -> bool:
+    """Validate train_data_dir which can now be either a directory (legacy) or a tar archive file.
+
+    The GUI previously only accepted folders; dataloader changes allow tar streams. We log intent here.
+    """
+    if train_data_path == "":
+        return True
+    # Accept directory
+    if os.path.isdir(train_data_path):
+        return validate_folder_path(train_data_path)
+    # Accept tar-like file
+    if is_tar_like_file(train_data_path):
+        msg = f"Validating {train_data_path} tar archive existence..."
+        log.info(f"{msg} SUCCESS")
+        return True
+    log.error(
+        f"Validating {train_data_path} FAILED: not a directory or supported tar archive (.tar[.gz|.bz2|.xz|.zst])"
+    )
+    return False
+
+
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _count_images_in_nested_tar(fileobj) -> int:
+    """Count images (recursively handling nested tar files) inside a tar given a file object.
+
+    This is used for the new top-level repeat step estimation logic where nested tars inside
+    a top-level repeat folder / tar should have their images included. We attribute all nested
+    images to the already-determined repeat bucket outside this call, so we only return a flat count.
+    """
+    count = 0
+    try:
+        with tarfile.open(fileobj=fileobj, mode="r:*") as tf_inner:
+            for m in tf_inner.getmembers():
+                if not m.isfile():
+                    continue
+                name_lower = m.name.lower()
+                if name_lower.endswith(IMAGE_EXTENSIONS):
+                    count += 1
+                else:
+                    # Handle nested tar recursively
+                    if is_tar_like_file(m.name):
+                        try:
+                            extracted = tf_inner.extractfile(m)
+                            if extracted is not None:
+                                data = extracted.read()
+                                count += _count_images_in_nested_tar(io.BytesIO(data))
+                        except Exception as e:
+                            log.warning(f"Failed to read nested tar '{m.name}' inside tar: {e}")
+    except Exception as e:
+        log.warning(f"Failed to open nested tar: {e}")
+    return count
+
+
+def estimate_top_level_repeat_steps(train_data_dir: str) -> int:
+    """Estimate total steps based on the clarified rule:
+
+    Only consider immediate children (directory entries OR tar files) under the root (which itself
+    can be a directory or a tar archive). A child whose basename matches '^\n+_' pattern defines a
+    repeat bucket. For such a bucket we recursively collect ALL images below it (including any
+    nested subfolders and nested tar archives) without further repeat pattern checks. Each bucket
+    contributes: repeats * image_count.
+
+    For a root tar archive, "immediate children" are the top-level path components. All image files
+    whose first path component is the repeat bucket are counted recursively; nested tars encountered
+    beneath that component are opened and scanned.
+    """
+    if not train_data_dir:
+        return 0
+
+    repeat_pattern = re.compile(r"^(\d+)_")
+    total_steps = 0
+
+    # Directory root case
+    if os.path.isdir(train_data_dir):
+        try:
+            entries = os.listdir(train_data_dir)
+        except Exception as e:
+            log.error(f"Failed to list directory '{train_data_dir}': {e}")
+            return 0
+        for name in entries:
+            full_path = os.path.join(train_data_dir, name)
+            if not repeat_pattern.match(name):
+                continue  # only top-level repeat buckets
+            # Extract repeats
+            try:
+                repeats = int(name.split("_")[0])
+            except ValueError:
+                continue
+
+            image_count = 0
+            if os.path.isdir(full_path):
+                # Walk all descendants; include nested tar archives
+                for root_dir, _dirs, files in os.walk(full_path):
+                    for f in files:
+                        lower_f = f.lower()
+                        if lower_f.endswith(IMAGE_EXTENSIONS):
+                            image_count += 1
+                        else:
+                            # Nested tar inside repeat folder
+                            if is_tar_like_file(f):
+                                nested_path = os.path.join(root_dir, f)
+                                try:
+                                    with open(nested_path, 'rb') as nf:
+                                        image_count += _count_images_in_nested_tar(nf)
+                                except Exception as e:
+                                    log.warning(f"Failed to open nested tar '{nested_path}': {e}")
+            else:
+                # Top-level tar file with repeat naming
+                if is_tar_like_file(full_path):
+                    try:
+                        with open(full_path, 'rb') as fobj:
+                            image_count += _count_images_in_nested_tar(fobj)
+                    except Exception as e:
+                        log.warning(f"Failed to open tar '{full_path}': {e}")
+                else:
+                    # Regular file (non-tar) cannot host images recursively; skip (no images counted)
+                    pass
+
+            steps = repeats * image_count
+            log.info(f"Folder {name}: {image_count} images * {repeats} repeats = {steps} steps (recursive)")
+            total_steps += steps
+        return total_steps
+
+    # Root tar archive case
+    if is_tar_like_file(train_data_dir):
+        try:
+            with tarfile.open(train_data_dir, 'r:*') as tf:
+                bucket_counts = {}
+                # First pass: collect images and nested tars per top-level bucket
+                members = tf.getmembers()
+                for m in members:
+                    if not m.isfile():
+                        continue
+                    rel = m.name.lstrip('./')
+                    parts = rel.split('/')
+                    if not parts:
+                        continue
+                    top = parts[0]
+                    if not repeat_pattern.match(top):
+                        continue
+                    # Direct image file under this bucket (any depth)
+                    lower_name = rel.lower()
+                    if lower_name.endswith(IMAGE_EXTENSIONS):
+                        bucket_counts[top] = bucket_counts.get(top, 0) + 1
+                        continue
+                    # Nested tar file inside bucket
+                    if is_tar_like_file(m.name):
+                        try:
+                            extracted = tf.extractfile(m)
+                            if extracted is not None:
+                                data = extracted.read()
+                                add_count = _count_images_in_nested_tar(io.BytesIO(data))
+                                if add_count:
+                                    bucket_counts[top] = bucket_counts.get(top, 0) + add_count
+                        except Exception as e:
+                            log.warning(f"Failed to open nested tar '{m.name}' in root tar: {e}")
+
+                # Now compute steps per bucket
+                for bucket, img_count in bucket_counts.items():
+                    try:
+                        repeats = int(bucket.split('_')[0])
+                    except ValueError:
+                        continue
+                    steps = repeats * img_count
+                    log.info(f"Tar folder {bucket}: {img_count} images * {repeats} repeats = {steps} steps (recursive)")
+                    total_steps += steps
+                if not bucket_counts:
+                    log.warning("No top-level repeat buckets with images found inside tar; total_steps remains 0. Set max_train_steps or use dataset_config.")
+        except Exception as e:
+            log.error(f"Failed to scan tar archive '{train_data_dir}' for step estimation: {e}. Set max_train_steps explicitly or use dataset_config.")
+            return 0
+        return total_steps
+
+    log.error("train_data_dir is neither directory nor recognized tar for step estimation.")
+    return 0
 
 
 def validate_toml_file(file_path: str) -> bool:

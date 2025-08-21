@@ -56,3 +56,7 @@ sd-scripts
 venv
 venv*
 .python-version
+
+# config toml and training json
+*.toml
+*.json

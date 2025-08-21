@@ -6,6 +6,8 @@ import time
 import sys
 import toml
 from datetime import datetime
+import tarfile
+import re
 from .common_gui import (
     check_if_model_exist,
     color_aug_changed,
@@ -22,6 +24,9 @@ from .common_gui import (
     validate_model_path,
     validate_args_setting,
     setup_environment,
+    validate_train_data_path,
+    is_tar_like_file,
+    estimate_top_level_repeat_steps,
 )
 from .class_accelerate_launch import AccelerateLaunch
 from .class_configuration_file import ConfigurationFile
@@ -707,7 +712,7 @@ def train_model(
     if not validate_folder_path(resume):
         return TRAIN_BUTTON_VISIBLE
 
-    if not validate_folder_path(train_data_dir):
+    if not validate_train_data_path(train_data_dir):
         return TRAIN_BUTTON_VISIBLE
 
     if not validate_model_path(vae):
@@ -735,50 +740,8 @@ def train_model(
         if train_data_dir == "":
             log.error("Train data dir is empty")
             return TRAIN_BUTTON_VISIBLE
-
-        # Get a list of all subfolders in train_data_dir
-        subfolders = [
-            f
-            for f in os.listdir(train_data_dir)
-            if os.path.isdir(os.path.join(train_data_dir, f))
-        ]
-
-        total_steps = 0
-
-        # Loop through each subfolder and extract the number of repeats
-        for folder in subfolders:
-            try:
-                # Extract the number of repeats from the folder name
-                repeats = int(folder.split("_")[0])
-                log.info(f"Folder {folder}: {repeats} repeats found")
-
-                # Count the number of images in the folder
-                num_images = len(
-                    [
-                        f
-                        for f, lower_f in (
-                            (file, file.lower())
-                            for file in os.listdir(os.path.join(train_data_dir, folder))
-                        )
-                        if lower_f.endswith((".jpg", ".jpeg", ".png", ".webp"))
-                    ]
-                )
-
-                log.info(f"Folder {folder}: {num_images} images found")
-
-                # Calculate the total number of steps for this folder
-                steps = repeats * num_images
-
-                # log.info the result
-                log.info(f"Folder {folder}: {num_images} * {repeats} = {steps} steps")
-
-                total_steps += steps
-
-            except ValueError:
-                # Handle the case where the folder name does not contain an underscore
-                log.info(
-                    f"Error: '{folder}' does not contain an underscore, skipping..."
-                )
+        # Unified top-level repeat estimation (directory or tar root) per clarified requirement
+        total_steps = estimate_top_level_repeat_steps(train_data_dir)
 
         if reg_data_dir == "":
             reg_factor = 1
